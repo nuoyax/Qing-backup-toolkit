@@ -279,6 +279,36 @@ function Get-CatalogFileCandidates {
     return $candidates
 }
 
+function Invoke-RunspacePoolBatch {
+    param(
+        [array]$Runspaces,
+        [int]$Total,
+        [string]$Phase,
+        [scriptblock]$OnResult
+    )
+
+    $remaining = New-Object System.Collections.Generic.List[object]
+    foreach ($rs in $Runspaces) { [void]$remaining.Add($rs) }
+
+    $done = 0
+    while ($remaining.Count -gt 0) {
+        for ($i = $remaining.Count - 1; $i -ge 0; $i--) {
+            $rs = $remaining[$i]
+            if (-not $rs.Handle.IsCompleted) { continue }
+
+            $result = $rs.PS.EndInvoke($rs.Handle)
+            $rs.PS.Dispose()
+            $done++
+            & $OnResult $rs $result $done $Total
+            $remaining.RemoveAt($i)
+        }
+
+        if ($remaining.Count -gt 0) {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 function Get-ScanFileCandidates {
     param(
         [string[]]$DriveLetters,
@@ -305,12 +335,51 @@ function Get-ScanFileCandidates {
         if ($CategoryFilter.Count -gt 0 -and ($CategoryFilter -notcontains $scanCat.Id)) { continue }
         if ($scanCat.ScanType -eq 'large_files' -and $MinLargeFileBytes -le 0) { continue }
 
+        if ($scanCat.ScanType -eq 'source_code') {
+            $searchRoots = @(Get-ScanRootsByType -ScanType $scanCat.ScanType -DriveLetters $DriveLetters -LargeFileDriveLetters $LargeFileDriveLetters)
+            Write-Host 'Discovering git/readme project roots...' -ForegroundColor Yellow
+            $projects = Discover-SourceCodeProjectRoots -SearchRoots $searchRoots -BackupRoot $BackupRoot
+            $gitCount = @($projects | Where-Object { $_.Kind -eq 'git' }).Count
+            $readmeCount = @($projects | Where-Object { $_.Kind -eq 'readme' }).Count
+            Write-Host ("Found {0} git projects, {1} readme projects" -f $gitCount, $readmeCount) -ForegroundColor Cyan
+            foreach ($proj in $projects) {
+                $jobs.Add(@{
+                    ScanCat     = $scanCat
+                    Root        = $proj.Root
+                    ProjectKind = $proj.Kind
+                })
+            }
+            continue
+        }
+
         foreach ($root in (Get-ScanRootsByType -ScanType $scanCat.ScanType -DriveLetters $DriveLetters -LargeFileDriveLetters $LargeFileDriveLetters)) {
             $jobs.Add(@{ ScanCat = $scanCat; Root = $root })
         }
     }
 
     if ($jobs.Count -eq 0) { return $candidates }
+
+    $splitJobs = New-Object System.Collections.Generic.List[object]
+    $sourceJobs = New-Object System.Collections.Generic.List[object]
+    foreach ($job in $jobs) {
+        if ($job.ScanCat.ScanType -eq 'source_code') {
+            [void]$sourceJobs.Add($job)
+        }
+        else {
+            [void]$splitJobs.Add($job)
+        }
+    }
+
+    $jobCountBefore = $jobs.Count
+    if ($splitJobs.Count -gt 0) {
+        $expanded = Expand-ScanJobsForParallelism -Jobs $splitJobs -MinJobs $ThreadCount -BackupRoot $BackupRoot
+        $jobs = New-Object System.Collections.Generic.List[object]
+        foreach ($job in $sourceJobs) { [void]$jobs.Add($job) }
+        foreach ($job in $expanded) { [void]$jobs.Add($job) }
+    }
+    if ($jobs.Count -gt $jobCountBefore) {
+        Write-Host ("Scan tasks expanded: {0} -> {1} (threads {2})" -f $jobCountBefore, $jobs.Count, $ThreadCount) -ForegroundColor Cyan
+    }
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $ThreadCount)
     $pool.Open()
@@ -326,24 +395,18 @@ function Get-ScanFileCandidates {
         @{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $job }
     }
 
-    $done = 0
-    foreach ($rs in $runspaces) {
-        $batch = $rs.PS.EndInvoke($rs.Handle)
-        $rs.PS.Dispose()
-        $done++
-        $jobLabel = "$($rs.Job.ScanCat.Name) | $($rs.Job.Root)"
-        Show-ProgressBar -Done $done -Total $jobs.Count -Status $jobLabel -Phase '扫描磁盘'
+    Invoke-RunspacePoolBatch -Runspaces $runspaces -Total $jobs.Count -Phase '扫描磁盘' -OnResult {
+        param($Rs, $Batch, $Done, $Total)
 
-        foreach ($item in $batch) {
+        $kindTag = if ($Rs.Job.ProjectKind) { "[$($Rs.Job.ProjectKind)] " } else { '' }
+        $jobLabel = "$($Rs.Job.ScanCat.Name) | ${kindTag}$($Rs.Job.Root)"
+        Show-ProgressBar -Done $Done -Total $Total -Status $jobLabel -Phase '扫描磁盘'
+
+        foreach ($item in $Batch) {
             $key = $item.SourcePath.ToLowerInvariant()
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
-            $candidates.Add($item)
-            if ($MaxFiles -gt 0 -and $candidates.Count -ge $MaxFiles) {
-                $pool.Close(); $pool.Dispose()
-                Complete-ProgressBar
-                return $candidates
-            }
+            [void]$candidates.Add($item)
         }
     }
 
@@ -726,8 +789,9 @@ function Read-InteractiveChoice {
 }
 
 function Read-CompressChoice {
-    $input = Read-Host 'Create compressed archive (same name as folder, placed alongside)? (Y/N) [N]'
-    return ($input -in @('Y', 'y'))
+    $input = Read-Host 'Create compressed archive (same name as folder, placed alongside)? (Y/N) [Y]'
+    if ([string]::IsNullOrWhiteSpace($input)) { return $true }
+    return ($input -notin @('N', 'n'))
 }
 
 function Read-DriveSelection {

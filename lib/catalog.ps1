@@ -160,7 +160,7 @@ function Get-BackupCatalog {
         }
         @{
             Id = 'drive_source_code'; Name = '全盘源代码'
-            Description = '各磁盘中的项目源代码（自动排除 node_modules、venv、vendor 等依赖目录）。'
+            Description = '优先备份含 .git 的工程目录；无 Git 时备份含 README 的目录（仍排除依赖目录）。'
             Items = @(); IsScanOnly = $true; ScanType = 'source_code'
         }
         @{
@@ -254,12 +254,14 @@ function Get-CodeDependencyExcludePatterns {
         '\.git\', '\.svn\', '\.hg\', '\.bzr\',
         '\__pycache__\', '\.pytest_cache\', '\.tox\', '\.mypy_cache\',
         '\.venv\', '\venv\', '\env\', '\.env\', '\site-packages\',
-        '\.gradle\caches\', '\.gradle\wrapper\dists\', '\.m2\repository\',
-        '\.nuget\packages\', '\go\pkg\', '\.cargo\registry\', '\.cargo\git\',
+        '\.gradle\', '\.gradle\caches\', '\.gradle\wrapper\dists\', '\.m2\repository\',
+        '\.nuget\', '\.nuget\packages\', '\.dotnet\', '\go\pkg\',
+        '\.rustup\', '\.cargo\',
         '\.next\', '\.nuxt\', '\.svelte-kit\', '\.turbo\', '\.parcel-cache\',
         '\.dart_tool\', '\.pub-cache\', '\.stack-work\',
         '\pods\', '\deriveddata\', '\.idea\caches\', '\.vs\',
         '\coverage\', '\.nyc_output\', '\.sass-cache\',
+        '\.npm\', '\.cache\', '\.local\share\pnpm\',
         '\tmp\', '\temp\', '\logs\', '\log\'
     )
 }

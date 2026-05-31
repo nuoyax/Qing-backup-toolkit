@@ -43,7 +43,7 @@ $includeScan = $false
 $includeCatalog = $false
 $scanMaxFiles = 0
 $largeFileScan = @{ Enabled = $false; MinLargeFileMB = 0; Drives = @() }
-$EnableCompress = $false
+$EnableCompress = $true
 
 switch ($BackupMode) {
     'config' {
@@ -121,6 +121,7 @@ else {
     }
     if ($Threads -le 0) { $Threads = Get-DefaultThreadCount }
     if ($TestMode) {
+        $EnableCompress = $false
         $BackupMode = 'config'
         $includeCatalog = $true
         $includeScan = $false
@@ -182,6 +183,7 @@ if ($includeCatalog) {
 if ($includeScan) {
     $phaseStep++
     Show-BackupPhaseHeader -Step $phaseStep -Total $phaseTotal -Name '扫描磁盘'
+    Write-Host ("Parallel scan: {0} threads (large folders split into sub-tasks)" -f $Threads) -ForegroundColor Cyan
     foreach ($item in (Get-ScanFileCandidates -DriveLetters $Drives -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -CategoryFilter $categoryFilter -MinLargeFileBytes $MinLargeFileBytes -LargeFileDriveLetters $LargeFileDrives -ThreadCount $Threads -MaxFiles $scanMaxFiles)) {
         $exists = $false
         foreach ($existing in $candidates) {

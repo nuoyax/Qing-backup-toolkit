@@ -1,6 +1,6 @@
 ﻿# Qing Backup Toolkit
 
-备份与恢复 Windows 上的**敏感配置**、**源代码**、**文档**与**大文件**，全部支持多核并行；**压缩为可选**（默认关闭），按类型分目录存放。
+备份与恢复 Windows 上的**敏感配置**、**源代码**、**文档**与**大文件**，全部支持多核并行；**默认压缩**为与文件夹同名的 zip（可关闭），按类型分目录存放。
 
 ## 入口（推荐从主菜单进入）
 
@@ -10,7 +10,7 @@
 |------|------|------|
 | 1 | `test_backup.bat` | 快速测试（约 5 秒） |
 | 2 | `backup.bat` | 敏感配置备份（分类多选） |
-| 3 | `backup_code.bat` | 全盘源代码（不含依赖） |
+| 3 | `backup_code.bat` | 全盘源代码（优先 .git 工程，其次 README 工程） |
 | 4 | `backup_docs.bat` | 全盘文档（500MB 以下） |
 | 5 | `backup_large.bat` | 磁盘大文件（默认 ≥500MB） |
 | 6 | `restore.bat` | 恢复 / 导出下载 |
@@ -66,8 +66,8 @@ Administrator_2026-05-31_143052_large_backup/    # 大文件
 
 ### 2. 全盘源代码备份（选项 3）
 
-- 扫描所选磁盘（默认全部）中的源代码文件
-- **自动排除依赖目录**：`node_modules`、`venv`、`.git`、`vendor`、`target`、`build`、`dist` 等
+- 优先扫描含 **`.git`** 的工程目录，其次扫描含 **`README`** 的目录
+- **自动排除依赖目录**：`node_modules`、`venv`、`.rustup`、`.cargo`、`vendor`、`target` 等
 - 输出到 `*_code_backup/`
 
 ### 3. 全盘文档备份（选项 4）

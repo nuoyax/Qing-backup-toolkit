@@ -24,6 +24,8 @@ function Get-DefaultExcludePatterns {
         '\$recycle.bin\', '\system volume information\',
         '\windows\', '\program files\', '\program files (x86)\',
         '\.codex\.tmp\',
+        '\.rustup\', '\.cargo\', '\.dotnet\', '\.nuget\', '\.gradle\',
+        '\.npm\', '\.cache\', '\.local\share\pnpm\',
         '\reqable\capture\',
         '\reqable\log\',
         '\qing-backup-toolkit\'
@@ -254,7 +256,8 @@ function Test-ScanRootFile {
 function Test-IsCodeDependencyPath {
     param([string]$FullPath)
 
-    $normalizedLower = $FullPath.Replace('/', '\').ToLowerInvariant()
+    $normalizedLower = $FullPath.Replace('/', '\').ToLowerInvariant().TrimEnd('\') + '\'
+
     foreach ($pattern in (Get-CodeDependencyExcludePatterns)) {
         if ($normalizedLower.Contains($pattern)) { return $true }
     }
@@ -283,7 +286,8 @@ function Add-ScanCandidate {
         [System.Collections.Generic.List[object]]$Found,
         [System.IO.FileInfo]$File,
         [string]$Root,
-        [object]$ScanCat
+        [object]$ScanCat,
+        [string]$ProjectKind = ''
     )
 
     $relative = $File.Name
@@ -294,7 +298,13 @@ function Add-ScanCandidate {
     $sizeMb = [math]::Round($file.Length / 1MB, 1)
     $desc = switch ($ScanCat.ScanType) {
         'large_files' { "大文件 ${sizeMb} MB" }
-        'source_code' { '源代码文件' }
+        'source_code' {
+            switch ($ProjectKind) {
+                'git' { 'Git 工程源代码' }
+                'readme' { 'README 工程源代码' }
+                default { '源代码文件' }
+            }
+        }
         'documents' { '文档文件' }
         'desktop' { '桌面/个人文件或敏感命名' }
         'user_personal' { '个人文件或敏感命名' }
@@ -311,6 +321,223 @@ function Add-ScanCandidate {
     })
 }
 
+function Test-IsReadmeFile {
+    param([string]$FileName)
+    return ($FileName -match '^(?i)readme(\..+)?$')
+}
+
+function Test-IsUnderGitProjectRoot {
+    param(
+        [string]$Path,
+        [System.Collections.Generic.HashSet[string]]$GitRoots
+    )
+
+    foreach ($gitRoot in $GitRoots) {
+        if ($Path.Equals($gitRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($Path.StartsWith($gitRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Discover-SourceCodeProjectRootsInRoot {
+    param(
+        [string]$SearchRoot,
+        [string]$BackupRoot
+    )
+
+    $gitRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $readmeRoots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    if (-not (Test-Path -LiteralPath $SearchRoot)) {
+        return @()
+    }
+
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($SearchRoot)
+
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot) { continue }
+        if (Test-IsCodeDependencyPath -FullPath $dir) { continue }
+
+        $isGitProject = $false
+        try {
+            foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
+                if (Test-IsCodeDependencyPath -FullPath $sub) { continue }
+
+                $subName = [System.IO.Path]::GetFileName($sub)
+                if ($subName -eq '.git') {
+                    [void]$gitRoots.Add($dir)
+                    $isGitProject = $true
+                    continue
+                }
+
+                $stack.Push($sub)
+            }
+        }
+        catch { continue }
+
+        if ($isGitProject) { continue }
+
+        if (-not (Test-IsUnderGitProjectRoot -Path $dir -GitRoots $gitRoots)) {
+            try {
+                foreach ($filePath in [System.IO.Directory]::EnumerateFiles($dir)) {
+                    if (Test-IsReadmeFile -FileName ([System.IO.Path]::GetFileName($filePath))) {
+                        [void]$readmeRoots.Add($dir)
+                        break
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    $projects = New-Object System.Collections.Generic.List[object]
+    foreach ($gitRoot in $gitRoots) {
+        $projects.Add(@{ Root = $gitRoot; Kind = 'git' })
+    }
+    foreach ($readmeRoot in $readmeRoots) {
+        if ($gitRoots.Contains($readmeRoot)) { continue }
+        if (Test-IsUnderGitProjectRoot -Path $readmeRoot -GitRoots $gitRoots) { continue }
+        $projects.Add(@{ Root = $readmeRoot; Kind = 'readme' })
+    }
+
+    return $projects.ToArray()
+}
+
+function Discover-SourceCodeProjectRoots {
+    param(
+        [string[]]$SearchRoots,
+        [string]$BackupRoot
+    )
+
+    $gitSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $readmeSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $projects = New-Object System.Collections.Generic.List[object]
+    $readmeCandidates = New-Object System.Collections.Generic.List[object]
+
+    foreach ($searchRoot in $SearchRoots) {
+        foreach ($proj in (Discover-SourceCodeProjectRootsInRoot -SearchRoot $searchRoot -BackupRoot $BackupRoot)) {
+            if ($proj.Kind -eq 'git') {
+                if ($gitSeen.Add($proj.Root)) {
+                    $projects.Add($proj)
+                }
+            }
+            else {
+                $readmeCandidates.Add($proj)
+            }
+        }
+    }
+
+    foreach ($proj in $readmeCandidates) {
+        if ($gitSeen.Contains($proj.Root)) { continue }
+        if (Test-IsUnderGitProjectRoot -Path $proj.Root -GitRoots $gitSeen) { continue }
+        if ($readmeSeen.Add($proj.Root)) {
+            $projects.Add($proj)
+        }
+    }
+
+    return $projects.ToArray()
+}
+
+function Test-ShouldSplitScanRoot {
+    param(
+        [string]$Root,
+        [string]$ScanType
+    )
+
+    if ($Root -match '^[A-Za-z]:\\$') { return $true }
+    if ($Root -eq $env:USERPROFILE) { return $true }
+    if ($Root -ieq 'C:\ProgramData') { return $true }
+    if ($ScanType -in @('large_files', 'source_code', 'documents')) { return $true }
+    return $false
+}
+
+function Expand-ScanJobsForParallelism {
+    param(
+        [System.Collections.Generic.List[object]]$Jobs,
+        [int]$MinJobs,
+        [string]$BackupRoot
+    )
+
+    if ($Jobs.Count -ge $MinJobs) { return $Jobs }
+
+    $expanded = New-Object System.Collections.Generic.List[object]
+    $maxJobs = [Math]::Max($MinJobs * 4, 64)
+
+    foreach ($job in $Jobs) {
+        if ($expanded.Count -ge $maxJobs) {
+            [void]$expanded.Add($job)
+            continue
+        }
+
+        $scanType = $job.ScanCat.ScanType
+        $root = [string]$job.Root
+        if (-not (Test-ShouldSplitScanRoot -Root $root -ScanType $scanType)) {
+            [void]$expanded.Add($job)
+            continue
+        }
+
+        $subDirs = New-Object System.Collections.Generic.List[string]
+        try {
+            foreach ($sub in [System.IO.Directory]::EnumerateDirectories($root)) {
+                if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
+                if ($scanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $sub)) { continue }
+                [void]$subDirs.Add($sub)
+            }
+        }
+        catch {
+            [void]$expanded.Add($job)
+            continue
+        }
+
+        if ($subDirs.Count -lt 2) {
+            [void]$expanded.Add($job)
+            continue
+        }
+
+        if (-not ($root -match '^[A-Za-z]:\\$')) {
+            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $root; FilesOnlyAtRoot = $true })
+        }
+
+        foreach ($sub in $subDirs) {
+            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $sub })
+            if ($expanded.Count -ge $maxJobs) { break }
+        }
+    }
+
+    if ($expanded.Count -gt $Jobs.Count) { return $expanded }
+    return $Jobs
+}
+
+function Invoke-ProcessScannedFile {
+    param(
+        [System.Collections.Generic.List[object]]$Found,
+        [string]$FilePath,
+        [string]$Root,
+        [object]$ScanCat,
+        [long]$MaxFileSizeBytes,
+        [long]$MinLargeFileBytes,
+        [string]$ProjectKind = ''
+    )
+
+    try {
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+        if ($ScanCat.ScanType -eq 'source_code' -and -not (Test-IsCodeFile -FileName $fileName)) { return }
+        if ($ScanCat.ScanType -eq 'documents' -and -not (Test-IsDocumentFile -FileName $fileName)) { return }
+
+        $file = [System.IO.FileInfo]::new($FilePath)
+        if ($ScanCat.ScanType -eq 'large_files') {
+            if ($file.Length -lt $MinLargeFileBytes -or $file.Length -gt $MaxFileSizeBytes) { return }
+        }
+        elseif ($file.Length -gt $MaxFileSizeBytes) { return }
+
+        Add-ScanCandidate -Found $Found -File $file -Root $Root -ScanCat $ScanCat -ProjectKind $ProjectKind
+    }
+    catch { }
+}
+
 function Invoke-SingleScanJob {
     param(
         [hashtable]$Job,
@@ -324,6 +551,32 @@ function Invoke-SingleScanJob {
     $root = $Job.Root
     $found = New-Object System.Collections.Generic.List[object]
     $allowPersonal = $scanCat.ScanType -in @('desktop', 'user_personal')
+    $filesOnlyAtRoot = $Job.ContainsKey('FilesOnlyAtRoot') -and $Job.FilesOnlyAtRoot
+    $projectKind = if ($Job.ContainsKey('ProjectKind')) { [string]$Job.ProjectKind } else { '' }
+
+    if ($filesOnlyAtRoot) {
+        try {
+            foreach ($filePath in [System.IO.Directory]::EnumerateFiles($root)) {
+                if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot) { continue }
+                if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $filePath)) { continue }
+                if ($scanCat.ScanType -in @('large_files', 'source_code', 'documents')) {
+                    Invoke-ProcessScannedFile -Found $found -FilePath $filePath -Root $root -ScanCat $scanCat -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -ProjectKind $projectKind
+                }
+                else {
+                    try {
+                        $file = [System.IO.FileInfo]::new($filePath)
+                        if ($file.Length -gt $MaxFileSizeBytes) { continue }
+                        if (-not (Test-ScanRootFile -File $file -RootPath $root -ScanType $scanCat.ScanType)) { continue }
+                        if (-not (Test-PersonalOrSensitiveFile -FileName $file.Name -FullPath $file.FullName -SensitivePatterns $sensitivePatterns -AllowPersonal:$allowPersonal -RootPath $root -MaxPersonalDepth $(if ($scanCat.ScanType -eq 'desktop') { 2 } else { 99 }))) { continue }
+                        Add-ScanCandidate -Found $found -File $file -Root $root -ScanCat $scanCat
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+        return $found
+    }
 
     if ($scanCat.ScanType -in @('large_files', 'source_code', 'documents')) {
         $stack = New-Object System.Collections.Generic.Stack[string]
@@ -341,22 +594,7 @@ function Invoke-SingleScanJob {
                 foreach ($filePath in [System.IO.Directory]::EnumerateFiles($dir)) {
                     if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot) { continue }
                     if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $filePath)) { continue }
-                    try {
-                        $file = [System.IO.FileInfo]::new($filePath)
-                        if ($scanCat.ScanType -eq 'large_files') {
-                            if ($file.Length -lt $MinLargeFileBytes -or $file.Length -gt $MaxFileSizeBytes) { continue }
-                        }
-                        elseif ($scanCat.ScanType -eq 'source_code') {
-                            if ($file.Length -gt $MaxFileSizeBytes) { continue }
-                            if (-not (Test-IsCodeFile -FileName $file.Name)) { continue }
-                        }
-                        elseif ($scanCat.ScanType -eq 'documents') {
-                            if ($file.Length -gt $MaxFileSizeBytes) { continue }
-                            if (-not (Test-IsDocumentFile -FileName $file.Name)) { continue }
-                        }
-                        Add-ScanCandidate -Found $found -File $file -Root $root -ScanCat $scanCat
-                    }
-                    catch { }
+                    Invoke-ProcessScannedFile -Found $found -FilePath $filePath -Root $root -ScanCat $scanCat -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -ProjectKind $projectKind
                 }
             }
             catch { }
