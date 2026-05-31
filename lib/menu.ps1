@@ -20,7 +20,7 @@ Write-Host '  [2] 敏感配置备份（分类多选 + 压缩）'
 
 Write-Host '  [3] 全盘源代码备份（不含依赖，压缩）'
 
-Write-Host '  [4] 全盘文档备份（500MB 以下，压缩）'
+Write-Host '  [4] 全盘文档备份（含图片，500MB 以下，压缩）'
 
 Write-Host '  [5] 磁盘大文件备份（默认 500MB 以上，压缩）'
 
@@ -98,7 +98,7 @@ switch ($choice) {
 
         Write-Host ''
 
-        Write-Host '[当前操作] 全盘文档备份' -ForegroundColor Yellow
+        Write-Host '[当前操作] 全盘文档备份（含图片）' -ForegroundColor Yellow
 
         & (Join-Path $PSScriptRoot 'backup.ps1') -BackupMode docs
 

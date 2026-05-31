@@ -11,7 +11,7 @@
 | 1 | `test_backup.bat` | 快速测试（约 5 秒） |
 | 2 | `backup.bat` | 敏感配置备份（分类多选） |
 | 3 | `backup_code.bat` | 全盘源代码（优先 .git 工程，其次 README 工程） |
-| 4 | `backup_docs.bat` | 全盘文档（500MB 以下） |
+| 4 | `backup_docs.bat` | 全盘文档与图片（500MB 以下） |
 | 5 | `backup_large.bat` | 磁盘大文件（默认 ≥500MB） |
 | 6 | `restore.bat` | 恢复 / 导出下载 |
 | 7 | README | 查看完整文档 |
@@ -67,19 +67,20 @@ Administrator_2026-05-31_143052_large_backup/    # 大文件
 
 ### 2. 全盘源代码备份（选项 3）
 
-- 优先扫描含 **`.git`** 的工程目录，其次扫描含 **`README`** 的目录
-- **自动排除依赖目录**：`node_modules`、`venv`、`.rustup`、`.cargo`、`vendor`、`target` 等
+- 优先扫描含 **`.git`** 的工程目录，**完整备份 `.git` 仓库**；其次扫描含 **`README`** 的目录
+- 排除 **node_modules、venv、vendor、Conda、Qt、Visual Studio** 等依赖与系统工具目录
 - 输出到 `*_code_backup/`
 
 ### 3. 全盘文档备份（选项 4）
 
-- 扫描 Word/Excel/PPT/PDF/TXT 等文档
+- 扫描 Word/Excel/PPT/PDF/TXT 等文档，以及 **JPG/PNG/GIF/WebP/HEIC/SVG** 等常见图片
 - 单文件 **500 MB 以下**
 - 输出到 `*_docs_backup/`
 
 ### 4. 磁盘大文件备份（选项 5）
 
 - 默认 **500 MB 以上**（可自定义阈值与单文件上限）
+- **自动跳过** Conda/miniconda、Qt、Visual Studio、Android SDK、CUDA、JetBrains 下载等系统/开发工具目录
 - 输出到 `*_large_backup/`
 
 ### 5. 恢复 / 导出（选项 6）
@@ -111,4 +112,5 @@ restore.bat "D:\backups\Administrator_2026-05-31_143052_config_backup"
 
 - 增删备份项：`lib/catalog.ps1`
 - 代码依赖排除：`Get-CodeDependencyExcludePatterns`
+- 系统工具目录排除：`Get-SystemToolExcludePatterns`
 - 扫描排除规则：`lib/scan_worker.ps1` → `Get-DefaultExcludePatterns`

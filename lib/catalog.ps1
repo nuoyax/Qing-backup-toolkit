@@ -160,17 +160,17 @@ function Get-BackupCatalog {
         }
         @{
             Id = 'drive_source_code'; Name = '全盘源代码'
-            Description = '优先备份含 .git 的工程目录；无 Git 时备份同时含 README 与源代码文件的目录（仍排除依赖目录）。'
+            Description = '优先备份含 .git 的工程目录（含 .git 仓库数据）；无 Git 时备份 README 工程。排除 node_modules、Conda/Qt/VS 等依赖与系统工具目录。'
             Items = @(); IsScanOnly = $true; ScanType = 'source_code'
         }
         @{
             Id = 'drive_documents'; Name = '全盘文档'
-            Description = '各磁盘中的办公/个人文档（Word/Excel/PDF 等，单文件默认 500MB 以下）。'
+            Description = '各磁盘中的办公/个人文档与图片（Word/Excel/PDF/JPG/PNG 等，单文件默认 500MB 以下）。'
             Items = @(); IsScanOnly = $true; ScanType = 'documents'
         }
         @{
             Id = 'drive_large_files'; Name = '磁盘大文件'
-            Description = '指定磁盘中超过阈值的大体积文件（默认 500MB 以上，可自定义）。'
+            Description = '指定磁盘中超过阈值的大体积文件（默认 500MB 以上）；自动跳过 Conda/Qt/Visual Studio 等系统工具目录。'
             Items = @(); IsScanOnly = $true; ScanType = 'large_files'
         }
         @{
@@ -236,9 +236,9 @@ function Get-ConfigBackupCategoryIds {
 function Get-BackupTypeInfo {
     return @{
         config = @{ Name = '敏感配置'; FolderSuffix = 'config'; Description = 'SSH/IDE/浏览器等敏感配置' }
-        code   = @{ Name = '全盘源代码'; FolderSuffix = 'code'; Description = '源代码（不含依赖目录）' }
-        docs   = @{ Name = '全盘文档'; FolderSuffix = 'docs'; Description = '办公与个人文档（500MB 以下）' }
-        large  = @{ Name = '磁盘大文件'; FolderSuffix = 'large'; Description = '大体积文件（默认 500MB 以上）' }
+        code   = @{ Name = '全盘源代码'; FolderSuffix = 'code'; Description = '源代码（含 .git，排除依赖/Conda/Qt/VS 等）' }
+        docs   = @{ Name = '全盘文档'; FolderSuffix = 'docs'; Description = '办公与个人文档及图片（500MB 以下）' }
+        large  = @{ Name = '磁盘大文件'; FolderSuffix = 'large'; Description = '大体积文件（跳过 Conda/Qt/VS 等工具目录）' }
     }
 }
 
@@ -259,6 +259,38 @@ function Get-CodeFileExtensions {
         '.ini', '.conf', '.cfg', '.properties',
         '.md', '.markdown', '.rst', '.tex', '.latex',
         '.dockerfile', '.containerfile', '.makefile', '.mk'
+    )
+}
+
+function Get-SystemToolExcludePatterns {
+    return @(
+        '\miniconda3\', '\miniconda\', '\anaconda3\', '\anaconda2\', '\anaconda\',
+        '\miniforge3\', '\miniforge\', '\mambaforge\', '\micromamba\',
+        '\.conda\', '\conda-bld\', '\conda-meta\',
+        '\appdata\local\programs\python\', '\appdata\local\continuum\',
+        '\qtcreator\', '\qt-tools\', '\qtinstaller\',
+        '\microsoft visual studio\', '\microsoft sdks\', '\windows kits\',
+        '\microsoft.net\', '\msbuild\', '\microsoft\microsoft net\',
+        '\programdata\microsoft\', '\programdata\package cache\',
+        '\programdata\chocolatey\lib\', '\programdata\chocolatey\bin\',
+        '\appdata\local\microsoft\visualstudio\', '\appdata\local\microsoft\winget\',
+        '\appdata\local\microsoft\dotnet\', '\appdata\local\microsoft\azure\',
+        '\appdata\local\microsoft\vs\', '\appdata\local\programs\microsoft\',
+        '\appdata\local\programs\microsoft vs code\',
+        '\android\sdk\', '\androidstudio\', '\android studio\',
+        '\appdata\local\android\', '\gradle\caches\',
+        '\openjdk\', '\jdk-', '\jbr\', '\adoptium\', '\temurin\',
+        '\flutter\', '\dart-sdk\', '\pub-cache\',
+        '\wsl\', '\docker\desktop\',
+        '\oracle\', '\virtualbox\',
+        '\nvidia gpu computing toolkit\', '\cuda\', '\cudnn\',
+        '\intel\oneapi\', '\intel\sfx\',
+        '\jetbrains\downloads\', '\appdata\local\jetbrains\',
+        '\nodejs\', '\npm-cache\',
+        '\llvm\', '\clang\', '\mingw64\', '\mingw32\', '\msys2\', '\cygwin\',
+        '\texlive\', '\miktex\',
+        '\huggingface\', '\ollama\', '\stable-diffusion\',
+        '\vmware\', '\virtual machines\'
     )
 }
 
@@ -305,7 +337,11 @@ function Get-DocumentFileExtensions {
         '.epub', '.mobi', '.azw', '.azw3',
         '.one', '.note', '.enex',
         '.xmind', '.mm', '.mmap',
-        '.wps', '.wpt', '.dbf'
+        '.wps', '.wpt', '.dbf',
+        '.jpg', '.jpeg', '.jfif', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico',
+        '.tif', '.tiff', '.heic', '.heif', '.avif', '.apng',
+        '.raw', '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2',
+        '.psd', '.ai', '.eps'
     )
 }
 

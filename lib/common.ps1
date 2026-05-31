@@ -597,6 +597,8 @@ function Get-ScanFileCandidates {
             $readmeCount = @($projects | Where-Object { $_.Kind -eq 'readme' }).Count
             Write-Host ("Found {0} git projects, {1} readme projects" -f $gitCount, $readmeCount) -ForegroundColor Cyan
             foreach ($proj in $projects) {
+                if (Test-ShouldExcludePath -FullPath $proj.Root -BackupRoot $BackupRoot -ScanType 'source_code') { continue }
+                if (Test-IsExcludedFromSourceBackupPath -FullPath $proj.Root) { continue }
                 if (Test-BackupScopeTripped -Breaker $FaultBreaker -ScopeKey $proj.Root) {
                     if ($null -ne $FaultBreaker) { $FaultBreaker.TotalSkipped++ }
                     continue

@@ -46,11 +46,11 @@ Write-Host '【工具说明】'
 
 Write-Host '  1. 敏感配置：SSH、IDE、浏览器、聊天、代理等'
 
-Write-Host '  2. 全盘源代码：排除 node_modules/venv/vendor 等依赖'
+Write-Host '  2. 全盘源代码：含 .git 仓库，排除 node_modules/Conda/Qt/VS 等'
 
-Write-Host '  3. 全盘文档：Office/PDF 等，单文件 500MB 以下'
+Write-Host '  3. 全盘文档：Office/PDF/图片等，单文件 500MB 以下'
 
-Write-Host '  4. 磁盘大文件：默认 500MB 以上（可自定义）'
+Write-Host '  4. 磁盘大文件：默认 500MB 以上，跳过 Conda/Qt/VS 等工具目录'
 
 Write-Host ''
 

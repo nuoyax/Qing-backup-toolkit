@@ -5,7 +5,7 @@ Set-StrictMode -Version Latest
 
 function Get-DefaultExcludePatterns {
     return @(
-        '\node_modules\', '\.git\objects\', '\.git\lfs\', '\cache\', '\caches\',
+        '\node_modules\', '\.svn\', '\.hg\', '\cache\', '\caches\',
         '\temp\', '\tmp\', '\.venv\', '\venv\', '\__pycache__\',
         '\appdata\local\google\chrome\application\',
         '\appdata\local\microsoft\windows\inetcache\',
@@ -36,7 +36,8 @@ function Test-ShouldExcludePath {
     param(
         [string]$FullPath,
         [string]$BackupRoot,
-        [string[]]$ExtraExcludeRoots = @()
+        [string[]]$ExtraExcludeRoots = @(),
+        [string]$ScanType = ''
     )
 
     $normalizedLower = $FullPath.Replace('/', '\').ToLowerInvariant()
@@ -52,11 +53,15 @@ function Test-ShouldExcludePath {
 
     if ($normalizedLower -match '\\desktop\\[^\\]*_backup(\\|$)') { return $true }
 
+    if ($ScanType -ne 'source_code' -and $normalizedLower.Contains('\.git\')) { return $true }
+
     foreach ($pattern in (Get-DefaultExcludePatterns)) {
         if ($normalizedLower.Contains($pattern)) { return $true }
     }
 
-    if (Test-IsCodeDependencyPath -FullPath $FullPath) { return $true }
+    if (Test-IsCodeDependencyPath -FullPath $FullPath -ScanType $ScanType) { return $true }
+
+    if (Test-IsSystemToolPath -FullPath $FullPath) { return $true }
 
     return $false
 }
@@ -256,13 +261,36 @@ function Test-ScanRootFile {
 }
 
 function Test-IsCodeDependencyPath {
-    param([string]$FullPath)
+    param(
+        [string]$FullPath,
+        [string]$ScanType = ''
+    )
 
     $normalizedLower = $FullPath.Replace('/', '\').ToLowerInvariant().TrimEnd('\') + '\'
 
     foreach ($pattern in (Get-CodeDependencyExcludePatterns)) {
+        if ($ScanType -eq 'source_code' -and $pattern -eq '\.git\') { continue }
         if ($normalizedLower.Contains($pattern)) { return $true }
     }
+    return $false
+}
+
+function Test-IsSystemToolPath {
+    param([string]$FullPath)
+
+    $normalizedLower = $FullPath.Replace('/', '\').ToLowerInvariant().TrimEnd('\') + '\'
+
+    foreach ($pattern in (Get-SystemToolExcludePatterns)) {
+        if ($normalizedLower.Contains($pattern)) { return $true }
+    }
+    return $false
+}
+
+function Test-IsExcludedFromSourceBackupPath {
+    param([string]$FullPath)
+
+    if (Test-IsCodeDependencyPath -FullPath $FullPath -ScanType 'source_code') { return $true }
+    if (Test-IsSystemToolPath -FullPath $FullPath) { return $true }
     return $false
 }
 
@@ -307,7 +335,7 @@ function Add-ScanCandidate {
                 default { '源代码文件' }
             }
         }
-        'documents' { '文档文件' }
+        'documents' { '文档/图片文件' }
         'desktop' { '桌面/个人文件或敏感命名' }
         'user_personal' { '个人文件或敏感命名' }
         default { '按规则扫描到的敏感文件' }
@@ -392,8 +420,8 @@ function Discover-SourceCodeProjectRootsInRoot {
 
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
-        if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot) { continue }
-        if (Test-IsCodeDependencyPath -FullPath $dir) { continue }
+        if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot -ScanType 'source_code') { continue }
+        if (Test-IsExcludedFromSourceBackupPath -FullPath $dir) { continue }
         if (Test-IsUnderGitProjectRoot -Path $dir -GitRoots $gitRoots) { continue }
         if (Test-IsUnderProjectRoot -Path $dir -Roots $readmeRoots) { continue }
 
@@ -402,8 +430,8 @@ function Discover-SourceCodeProjectRootsInRoot {
 
         try {
             foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
-                if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
-                if (Test-IsCodeDependencyPath -FullPath $sub) { continue }
+                if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot -ScanType 'source_code') { continue }
+                if (Test-IsExcludedFromSourceBackupPath -FullPath $sub) { continue }
 
                 $subName = [System.IO.Path]::GetFileName($sub)
                 if ($subName -eq '.git') {
@@ -646,6 +674,12 @@ function Expand-ScanJobsForParallelism {
     return $Jobs
 }
 
+function Test-IsUnderGitDirectory {
+    param([string]$FullPath)
+
+    return $FullPath.Replace('/', '\').ToLowerInvariant().Contains('\.git\')
+}
+
 function Invoke-ProcessScannedFile {
     param(
         [System.Collections.Generic.List[object]]$Found,
@@ -659,7 +693,9 @@ function Invoke-ProcessScannedFile {
 
     try {
         $fileName = [System.IO.Path]::GetFileName($FilePath)
-        if ($ScanCat.ScanType -eq 'source_code' -and -not (Test-IsCodeFile -FileName $fileName)) { return }
+        if ($ScanCat.ScanType -eq 'source_code' -and -not (Test-IsCodeFile -FileName $fileName)) {
+            if (-not (Test-IsUnderGitDirectory -FullPath $FilePath)) { return }
+        }
         if ($ScanCat.ScanType -eq 'documents' -and -not (Test-IsDocumentFile -FileName $fileName)) { return }
 
         $file = [System.IO.FileInfo]::new($FilePath)
@@ -717,17 +753,17 @@ function Invoke-SingleScanJob {
         $stack.Push($root)
         while ($stack.Count -gt 0) {
             $dir = $stack.Pop()
-            if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot) { continue }
-            if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $dir)) { continue }
+            if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot -ScanType $scanCat.ScanType) { continue }
+            if ($scanCat.ScanType -eq 'source_code' -and (Test-IsExcludedFromSourceBackupPath -FullPath $dir)) { continue }
             try {
                 foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
-                    if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
-                    if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $sub)) { continue }
+                    if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot -ScanType $scanCat.ScanType) { continue }
+                    if ($scanCat.ScanType -eq 'source_code' -and (Test-IsExcludedFromSourceBackupPath -FullPath $sub)) { continue }
                     $stack.Push($sub)
                 }
                 foreach ($filePath in [System.IO.Directory]::EnumerateFiles($dir)) {
-                    if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot) { continue }
-                    if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $filePath)) { continue }
+                    if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot -ScanType $scanCat.ScanType) { continue }
+                    if ($scanCat.ScanType -eq 'source_code' -and (Test-IsExcludedFromSourceBackupPath -FullPath $filePath)) { continue }
                     Invoke-ProcessScannedFile -Found $found -FilePath $filePath -Root $root -ScanCat $scanCat -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -ProjectKind $projectKind
                 }
             }
