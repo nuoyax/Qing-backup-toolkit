@@ -56,6 +56,8 @@ function Test-ShouldExcludePath {
         if ($normalizedLower.Contains($pattern)) { return $true }
     }
 
+    if (Test-IsCodeDependencyPath -FullPath $FullPath) { return $true }
+
     return $false
 }
 
@@ -476,6 +478,85 @@ function Discover-SourceCodeProjectRoots {
     return $projects.ToArray()
 }
 
+function Get-ScanDepthAnchor {
+    param(
+        [object]$ScanCat,
+        [string]$JobRoot
+    )
+
+    if ($ScanCat.ScanType -eq 'desktop') {
+        return [Environment]::GetFolderPath('Desktop')
+    }
+    return $JobRoot
+}
+
+function Get-DirDepthFromAnchor {
+    param(
+        [string]$DirPath,
+        [string]$AnchorRoot
+    )
+
+    if (-not $DirPath.StartsWith($AnchorRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return 99
+    }
+
+    $relative = $DirPath.Substring($AnchorRoot.Length).TrimStart('\')
+    if ([string]::IsNullOrWhiteSpace($relative)) { return 0 }
+    return @($relative -split '\\').Count
+}
+
+function Get-ScanMaxPersonalDepth {
+    param([string]$ScanType)
+
+    if ($ScanType -eq 'desktop') { return 2 }
+    return 99
+}
+
+function Invoke-ScanPersonalTree {
+    param(
+        [System.Collections.Generic.List[object]]$Found,
+        [string]$Root,
+        [string]$AnchorRoot,
+        [object]$ScanCat,
+        [long]$MaxFileSizeBytes,
+        [string]$BackupRoot,
+        [hashtable]$SensitivePatterns,
+        [int]$MaxPersonalDepth = 99
+    )
+
+    $allowPersonal = $ScanCat.ScanType -in @('desktop', 'user_personal')
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Root)
+
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot) { continue }
+
+        try {
+            foreach ($filePath in [System.IO.Directory]::EnumerateFiles($dir)) {
+                if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot) { continue }
+                try {
+                    $file = [System.IO.FileInfo]::new($filePath)
+                    if ($file.Length -gt $MaxFileSizeBytes) { continue }
+                    if (-not (Test-ScanRootFile -File $file -RootPath $Root -ScanType $ScanCat.ScanType)) { continue }
+                    if (-not (Test-PersonalOrSensitiveFile -FileName $file.Name -FullPath $file.FullName -SensitivePatterns $SensitivePatterns -AllowPersonal:$allowPersonal -RootPath $AnchorRoot -MaxPersonalDepth $MaxPersonalDepth)) { continue }
+                    Add-ScanCandidate -Found $Found -File $file -Root $Root -ScanCat $ScanCat
+                }
+                catch { }
+            }
+
+            $dirDepth = Get-DirDepthFromAnchor -DirPath $dir -AnchorRoot $AnchorRoot
+            if (($dirDepth + 1) -ge $MaxPersonalDepth) { continue }
+
+            foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
+                $stack.Push($sub)
+            }
+        }
+        catch { }
+    }
+}
+
 function Test-ShouldSplitScanRoot {
     param(
         [string]$Root,
@@ -485,7 +566,7 @@ function Test-ShouldSplitScanRoot {
     if ($Root -match '^[A-Za-z]:\\$') { return $true }
     if ($Root -eq $env:USERPROFILE) { return $true }
     if ($Root -ieq 'C:\ProgramData') { return $true }
-    if ($ScanType -in @('large_files', 'source_code', 'documents')) { return $true }
+    if ($ScanType -in @('large_files', 'source_code', 'documents', 'desktop', 'user_personal', 'system')) { return $true }
     return $false
 }
 
@@ -538,7 +619,6 @@ function Expand-ScanJobsForParallelism {
         try {
             foreach ($sub in [System.IO.Directory]::EnumerateDirectories($root)) {
                 if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
-                if ($scanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $sub)) { continue }
                 [void]$subDirs.Add($sub)
             }
         }
@@ -606,27 +686,26 @@ function Invoke-SingleScanJob {
     $root = $Job.Root
     $found = New-Object System.Collections.Generic.List[object]
     $allowPersonal = $scanCat.ScanType -in @('desktop', 'user_personal')
-    $filesOnlyAtRoot = $Job.ContainsKey('FilesOnlyAtRoot') -and $Job.FilesOnlyAtRoot
-    $projectKind = if ($Job.ContainsKey('ProjectKind')) { [string]$Job.ProjectKind } else { '' }
+    $filesOnlyAtRoot = [string](Get-ScanJobOptionalProperty -Job $Job -Name 'FilesOnlyAtRoot') -eq 'True'
+    if ($Job -is [hashtable] -and $Job.ContainsKey('FilesOnlyAtRoot')) {
+        $filesOnlyAtRoot = [bool]$Job.FilesOnlyAtRoot
+    }
+    $projectKind = Get-ScanJobOptionalProperty -Job $Job -Name 'ProjectKind'
+    $anchorRoot = Get-ScanDepthAnchor -ScanCat $scanCat -JobRoot $root
+    $maxPersonalDepth = Get-ScanMaxPersonalDepth -ScanType $scanCat.ScanType
 
     if ($filesOnlyAtRoot) {
         try {
             foreach ($filePath in [System.IO.Directory]::EnumerateFiles($root)) {
                 if (Test-ShouldExcludePath -FullPath $filePath -BackupRoot $BackupRoot) { continue }
-                if ($scanCat.ScanType -eq 'source_code' -and (Test-IsCodeDependencyPath -FullPath $filePath)) { continue }
-                if ($scanCat.ScanType -in @('large_files', 'source_code', 'documents')) {
-                    Invoke-ProcessScannedFile -Found $found -FilePath $filePath -Root $root -ScanCat $scanCat -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -ProjectKind $projectKind
+                try {
+                    $file = [System.IO.FileInfo]::new($filePath)
+                    if ($file.Length -gt $MaxFileSizeBytes) { continue }
+                    if (-not (Test-ScanRootFile -File $file -RootPath $root -ScanType $scanCat.ScanType)) { continue }
+                    if (-not (Test-PersonalOrSensitiveFile -FileName $file.Name -FullPath $file.FullName -SensitivePatterns $sensitivePatterns -AllowPersonal:$allowPersonal -RootPath $anchorRoot -MaxPersonalDepth $maxPersonalDepth)) { continue }
+                    Add-ScanCandidate -Found $found -File $file -Root $root -ScanCat $scanCat
                 }
-                else {
-                    try {
-                        $file = [System.IO.FileInfo]::new($filePath)
-                        if ($file.Length -gt $MaxFileSizeBytes) { continue }
-                        if (-not (Test-ScanRootFile -File $file -RootPath $root -ScanType $scanCat.ScanType)) { continue }
-                        if (-not (Test-PersonalOrSensitiveFile -FileName $file.Name -FullPath $file.FullName -SensitivePatterns $sensitivePatterns -AllowPersonal:$allowPersonal -RootPath $root -MaxPersonalDepth $(if ($scanCat.ScanType -eq 'desktop') { 2 } else { 99 }))) { continue }
-                        Add-ScanCandidate -Found $found -File $file -Root $root -ScanCat $scanCat
-                    }
-                    catch { }
-                }
+                catch { }
             }
         }
         catch { }
@@ -657,20 +736,23 @@ function Invoke-SingleScanJob {
         return $found
     }
 
-    $files = if ($scanCat.ScanType -eq 'user_personal' -and $root -eq $env:USERPROFILE) {
-        Get-ChildItem -LiteralPath $root -File -Force -ErrorAction SilentlyContinue
-    }
-    else {
-        Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue
+    if ($scanCat.ScanType -eq 'user_personal' -and $root -eq $env:USERPROFILE) {
+        try {
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($root)) {
+                if (Test-ShouldExcludePath -FullPath $file -BackupRoot $BackupRoot) { continue }
+                try {
+                    $fileInfo = [System.IO.FileInfo]::new($file)
+                    if ($fileInfo.Length -gt $MaxFileSizeBytes) { continue }
+                    if (-not (Test-PersonalOrSensitiveFile -FileName $fileInfo.Name -FullPath $fileInfo.FullName -SensitivePatterns $sensitivePatterns -AllowPersonal:$allowPersonal -RootPath $anchorRoot -MaxPersonalDepth $maxPersonalDepth)) { continue }
+                    Add-ScanCandidate -Found $found -File $fileInfo -Root $root -ScanCat $scanCat
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return $found
     }
 
-    foreach ($file in $files) {
-        if (Test-ShouldExcludePath -FullPath $file.FullName -BackupRoot $BackupRoot) { continue }
-        if ($file.Length -gt $MaxFileSizeBytes) { continue }
-        if (-not (Test-ScanRootFile -File $file -RootPath $root -ScanType $scanCat.ScanType)) { continue }
-        if (-not (Test-PersonalOrSensitiveFile -FileName $file.Name -FullPath $file.FullName -SensitivePatterns $sensitivePatterns -AllowPersonal:$allowPersonal -RootPath $root -MaxPersonalDepth $(if ($scanCat.ScanType -eq 'desktop') { 2 } else { 99 }))) { continue }
-        Add-ScanCandidate -Found $found -File $file -Root $root -ScanCat $scanCat
-    }
-
+    Invoke-ScanPersonalTree -Found $found -Root $root -AnchorRoot $anchorRoot -ScanCat $scanCat -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -SensitivePatterns $sensitivePatterns -MaxPersonalDepth $maxPersonalDepth
     return $found
 }

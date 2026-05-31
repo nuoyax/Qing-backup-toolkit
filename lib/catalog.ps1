@@ -267,6 +267,8 @@ function Get-CodeDependencyExcludePatterns {
         '\node_modules\', '\bower_components\', '\vendor\', '\packages\',
         '\.pnpm\', '\.pnpm-store\', '\.yarn\', '\.yarn-cache\',
         '\target\', '\build\', '\dist\', '\out\', '\bin\', '\obj\',
+        '\debug\', '\release\', '\x64\', '\x86\', '\win32\',
+        '\cmake-build-debug\', '\cmake-build-release\', '\cmake-build\',
         '\.git\', '\.svn\', '\.hg\', '\.bzr\',
         '\__pycache__\', '\.pytest_cache\', '\.tox\', '\.mypy_cache\',
         '\.venv\', '\venv\', '\env\', '\.env\', '\site-packages\',
@@ -281,7 +283,14 @@ function Get-CodeDependencyExcludePatterns {
         '\tmp\', '\temp\', '\logs\', '\log\',
         '\models\', '\model\', '\weights\', '\checkpoints\', '\checkpoint\',
         '\dataset\', '\datasets\', '\training_data\', '\train_data\', '\test_data\',
-        '\samples\', '\raw_data\', '\pretrained\', '\pretrained_models\'
+        '\samples\', '\raw_data\', '\pretrained\', '\pretrained_models\',
+        '\third_party\', '\thirdparty\', '\3rdparty\',
+        '\deps\', '\dependencies\', '\external\', '\externals\', '\submodules\',
+        '\vcpkg\', '\vcpkg_installed\', '\conan\', '\.conan\',
+        '\googletest\', '\gtest\', '\gmock\',
+        '\qt\', '\qt5\', '\qt6\', '\qtbase\', '\qtdeclarative\', '\qtwebengine\',
+        '\qtmultimedia\', '\qtsvg\', '\qttools\', '\qtimageformats\', '\qtconnectivity\',
+        '\qtnetworkauth\', '\qtquickcontrols\', '\qtwayland\'
     )
 }
 

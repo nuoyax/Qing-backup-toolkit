@@ -488,17 +488,34 @@ function Invoke-RunspacePoolBatch {
         [int]$Total,
         [string]$Phase,
         [scriptblock]$OnResult,
-        $FaultBreaker = $null
+        $FaultBreaker = $null,
+        [int]$JobTimeoutSeconds = 600
     )
 
     $remaining = New-Object System.Collections.Generic.List[object]
     foreach ($rs in $Runspaces) { [void]$remaining.Add($rs) }
 
     $done = 0
+    $lastHeartbeat = Get-Date
     while ($remaining.Count -gt 0) {
+        $now = Get-Date
         for ($i = $remaining.Count - 1; $i -ge 0; $i--) {
             $rs = $remaining[$i]
-            if (-not $rs.Handle.IsCompleted) { continue }
+            if (-not $rs.Handle.IsCompleted) {
+                if ($JobTimeoutSeconds -gt 0 -and $rs.StartedAt) {
+                    $elapsed = ($now - $rs.StartedAt).TotalSeconds
+                    if ($elapsed -ge $JobTimeoutSeconds) {
+                        $context = if ($rs.Job -and $rs.Job.Root) { [string]$rs.Job.Root } else { $Phase }
+                        try { $null = $rs.PS.Stop() } catch { }
+                        $rs.PS.Dispose()
+                        $done++
+                        Register-BackupFault -Breaker $FaultBreaker -Phase $Phase -Context $context -Message ("Scan timeout after {0}s" -f $JobTimeoutSeconds) -ScopeKey $context
+                        & $OnResult $rs @() $done $Total @{ Ok = $false; Error = 'Scan timeout'; Context = $context }
+                        $remaining.RemoveAt($i)
+                    }
+                }
+                continue
+            }
 
             $context = if ($rs.Job) {
                 $root = if ($rs.Job.Root) { [string]$rs.Job.Root } else { '' }
@@ -522,6 +539,17 @@ function Invoke-RunspacePoolBatch {
         }
 
         if ($remaining.Count -gt 0) {
+            if (($now - $lastHeartbeat).TotalSeconds -ge 15) {
+                $pendingLabels = New-Object System.Collections.Generic.List[string]
+                foreach ($pending in $remaining) {
+                    if ($pendingLabels.Count -ge 2) { break }
+                    $label = if ($pending.Job -and $pending.Job.Root) { [string]$pending.Job.Root } else { $Phase }
+                    $waitSec = if ($pending.StartedAt) { [int](($now - $pending.StartedAt).TotalSeconds) } else { 0 }
+                    [void]$pendingLabels.Add(("{0} ({1}s)" -f $label, $waitSec))
+                }
+                Write-Host ("  {0}: {1}/{2} done, waiting {3} task(s): {4}" -f $Phase, $done, $Total, $remaining.Count, ($pendingLabels -join '; ')) -ForegroundColor DarkCyan
+                $lastHeartbeat = $now
+            }
             Start-Sleep -Milliseconds 50
         }
     }
@@ -631,10 +659,10 @@ function Get-ScanFileCandidates {
             }
         }).AddArgument($libPath).AddArgument($job).AddArgument($MaxFileSizeBytes).AddArgument($MinLargeFileBytes).AddArgument($BackupRoot)
         $ps.RunspacePool = $pool
-        @{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $job }
+        @{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $job; StartedAt = Get-Date }
     }
 
-    Invoke-RunspacePoolBatch -Runspaces $runspaces -Total $jobs.Count -Phase '扫描磁盘' -FaultBreaker $FaultBreaker -OnResult {
+    Invoke-RunspacePoolBatch -Runspaces $runspaces -Total $jobs.Count -Phase '扫描磁盘' -FaultBreaker $FaultBreaker -JobTimeoutSeconds 600 -OnResult {
         param($Rs, $Batch, $Done, $Total, $Completed)
 
         $projectKind = Get-ScanJobOptionalProperty -Job $Rs.Job -Name 'ProjectKind'
