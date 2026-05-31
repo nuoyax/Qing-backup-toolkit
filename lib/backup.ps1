@@ -90,8 +90,7 @@ if (-not $NonInteractive -and -not $TestMode) {
     }
 
     if ($BackupMode -eq 'config') {
-        $largeFileScan = Read-LargeFileScanOptions -AvailableDrives $availableDrives
-        $categoryFilter = Read-CategorySelection -Catalog $catalog -IncludeLargeFiles:$largeFileScan.Enabled
+        $categoryFilter = Read-CategorySelection -Catalog $catalog -Mode config
     }
     elseif ($BackupMode -eq 'large') {
         $minInput = Read-InteractiveChoice -Prompt 'Min large file size MB [500]' -Default '500'
@@ -128,7 +127,7 @@ else {
         $categoryFilter = Get-TestCategoryIds
     }
     elseif ($BackupMode -eq 'config') {
-        $categoryFilter = @($catalog | ForEach-Object { $_.Id })
+        $categoryFilter = Get-ConfigBackupCategoryIds -Catalog $catalog
     }
     if ($BackupMode -eq 'large') {
         $largeFileScan.Drives = $Drives
@@ -165,6 +164,8 @@ if ($categoryFilter.Count -gt 0) {
 }
 
 $candidates = [System.Collections.Generic.List[object]]::new()
+$candidateKeys = @{}
+$faultBreaker = New-BackupFaultBreaker -LogPath $LogPath
 
 $phaseStep = 0
 $phaseTotal = 1
@@ -175,8 +176,18 @@ if ($EnableCompress) { $phaseTotal++ }
 if ($includeCatalog) {
     $phaseStep++
     Show-BackupPhaseHeader -Step $phaseStep -Total $phaseTotal -Name '收集配置'
-    foreach ($item in (Get-CatalogFileCandidatesParallel -Catalog $catalog -CategoryFilter $categoryFilter -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -ThreadCount $Threads)) {
-        $candidates.Add($item)
+    try {
+        foreach ($item in (Get-CatalogFileCandidatesParallel -Catalog $catalog -CategoryFilter $categoryFilter -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -ThreadCount $Threads -FaultBreaker $faultBreaker)) {
+            $key = $item.SourcePath.ToLowerInvariant()
+            if (-not $candidateKeys.ContainsKey($key)) {
+                $candidateKeys[$key] = $true
+                $candidates.Add($item)
+            }
+        }
+    }
+    catch {
+        Register-BackupFault -Breaker $faultBreaker -Phase '收集配置' -Context 'catalog phase' -Message $_.Exception.Message
+        Write-Host ("Catalog collection error (continuing): {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
 }
 
@@ -184,12 +195,18 @@ if ($includeScan) {
     $phaseStep++
     Show-BackupPhaseHeader -Step $phaseStep -Total $phaseTotal -Name '扫描磁盘'
     Write-Host ("Parallel scan: {0} threads (large folders split into sub-tasks)" -f $Threads) -ForegroundColor Cyan
-    foreach ($item in (Get-ScanFileCandidates -DriveLetters $Drives -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -CategoryFilter $categoryFilter -MinLargeFileBytes $MinLargeFileBytes -LargeFileDriveLetters $LargeFileDrives -ThreadCount $Threads -MaxFiles $scanMaxFiles)) {
-        $exists = $false
-        foreach ($existing in $candidates) {
-            if ($existing.SourcePath -eq $item.SourcePath) { $exists = $true; break }
+    try {
+        foreach ($item in (Get-ScanFileCandidates -DriveLetters $Drives -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot -CategoryFilter $categoryFilter -MinLargeFileBytes $MinLargeFileBytes -LargeFileDriveLetters $LargeFileDrives -ThreadCount $Threads -MaxFiles $scanMaxFiles -FaultBreaker $faultBreaker)) {
+            $key = $item.SourcePath.ToLowerInvariant()
+            if (-not $candidateKeys.ContainsKey($key)) {
+                $candidateKeys[$key] = $true
+                $candidates.Add($item)
+            }
         }
-        if (-not $exists) { $candidates.Add($item) }
+    }
+    catch {
+        Register-BackupFault -Breaker $faultBreaker -Phase '扫描磁盘' -Context 'scan phase' -Message $_.Exception.Message
+        Write-Host ("Disk scan error (continuing): {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
 }
 
@@ -227,18 +244,33 @@ if ($finalCandidates.Count -eq 0) {
 $phaseStep++
 Show-BackupPhaseHeader -Step $phaseStep -Total $phaseTotal -Name '复制文件'
 Write-Host ("Copying {0} files with {1} threads..." -f $finalCandidates.Count, $Threads) -ForegroundColor Yellow
-$backedUp = Invoke-ParallelFileBackup -Candidates $finalCandidates -FilesRoot $FilesRoot -ThreadCount $Threads -OnProgress {
+$backedUp = Invoke-ParallelFileBackup -Candidates $finalCandidates -FilesRoot $FilesRoot -ThreadCount $Threads -FaultBreaker $faultBreaker -OnProgress {
     param($Done, $Total, $Item)
     Show-ProgressBar -Done $Done -Total $Total -Status $Item.SourcePath -Phase '复制文件'
 }
 
+$compressStats = $null
 if ($EnableCompress) {
     $phaseStep++
     Show-BackupPhaseHeader -Step $phaseStep -Total $phaseTotal -Name '压缩归档'
     Write-Host 'Creating compressed archive...' -ForegroundColor Yellow
-    Compress-BackupArchive -FilesRoot $FilesRoot -ArchivePath $ArchivePath
-    Remove-Item -LiteralPath $FilesRoot -Recurse -Force -ErrorAction SilentlyContinue
-    Write-LogLine -LogPath $LogPath -Message "Archive: $ArchivePath"
+    try {
+        $compressStats = Compress-BackupArchive -FilesRoot $FilesRoot -ArchivePath $ArchivePath -FaultBreaker $faultBreaker
+        if ($compressStats.Added -gt 0) {
+            Remove-Item -LiteralPath $FilesRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Write-LogLine -LogPath $LogPath -Message "Archive: $ArchivePath (added $($compressStats.Added), failed $($compressStats.Failed))"
+        }
+        else {
+            Register-BackupFault -Breaker $faultBreaker -Phase '压缩归档' -Context $ArchivePath -Message 'No files were added to archive'
+            Write-Host 'Compression produced no files; keeping uncompressed files/ folder.' -ForegroundColor Yellow
+            $EnableCompress = $false
+        }
+    }
+    catch {
+        Register-BackupFault -Breaker $faultBreaker -Phase '压缩归档' -Context $ArchivePath -Message $_.Exception.Message
+        Write-Host ("Compression failed (backup files kept): {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        $EnableCompress = $false
+    }
 }
 else {
     Write-LogLine -LogPath $LogPath -Message "Files: $FilesRoot (uncompressed)"
@@ -259,13 +291,21 @@ $meta = @{
     ArchiveName        = if ($EnableCompress) { $ArchiveName } else { '' }
     ArchivePath        = if ($EnableCompress) { $ArchivePath } else { '' }
     TestMode           = [bool]$TestMode
+    FaultCount         = $faultBreaker.TotalFailures
+    SkippedByBreaker   = $faultBreaker.TotalSkipped
 }
 
-Save-BackupManifest -ManifestPath $ManifestPath -Files $backedUp -Meta $meta -Catalog $catalog
-Write-BackupReport -ReportPath $ReportPath -Files $backedUp -Catalog $catalog -Meta $meta
+try {
+    Save-BackupManifest -ManifestPath $ManifestPath -Files $backedUp -Meta $meta -Catalog $catalog
+    Write-BackupReport -ReportPath $ReportPath -Files $backedUp -Catalog $catalog -Meta $meta
+}
+catch {
+    Register-BackupFault -Breaker $faultBreaker -Phase '写入报告' -Context $BackupRoot -Message $_.Exception.Message
+    Write-Host ("Failed to write manifest/report: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
 
 $failed = $finalCandidates.Count - $backedUp.Count
-Write-LogLine -LogPath $LogPath -Message ("Finished. Success={0} Failed={1}" -f $backedUp.Count, $failed)
+Write-LogLine -LogPath $LogPath -Message ("Finished. Success={0} Failed={1} Faults={2}" -f $backedUp.Count, $failed, $faultBreaker.TotalFailures)
 
 Write-Host ''
 Write-Host '========================================' -ForegroundColor Green
@@ -279,6 +319,10 @@ else {
     Write-Host "Files  : $FilesRoot"
 }
 Write-Host ("Backed : {0} files" -f $backedUp.Count)
+if ($failed -gt 0) {
+    Write-Host ("Failed : {0} files (see backup.log)" -f $failed) -ForegroundColor Yellow
+}
+Show-BackupFaultSummary -Breaker $faultBreaker
 Write-Host "Report : $ReportPath"
 Write-Host '========================================' -ForegroundColor Green
 Write-Host ''

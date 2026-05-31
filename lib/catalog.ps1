@@ -160,7 +160,7 @@ function Get-BackupCatalog {
         }
         @{
             Id = 'drive_source_code'; Name = '全盘源代码'
-            Description = '优先备份含 .git 的工程目录；无 Git 时备份含 README 的目录（仍排除依赖目录）。'
+            Description = '优先备份含 .git 的工程目录；无 Git 时备份同时含 README 与源代码文件的目录（仍排除依赖目录）。'
             Items = @(); IsScanOnly = $true; ScanType = 'source_code'
         }
         @{
@@ -217,6 +217,22 @@ function Get-TestCategoryIds {
     return @('ssh_git', 'cursor_ide', 'dev_tools')
 }
 
+function Get-DedicatedScanTypes {
+    return @('source_code', 'documents', 'large_files')
+}
+
+function Get-ConfigBackupCategoryIds {
+    param([array]$Catalog = (Get-BackupCatalog))
+
+    $excluded = Get-DedicatedScanTypes
+    return @($Catalog | Where-Object {
+        if ($_.ContainsKey('IsScanOnly') -and $_.IsScanOnly -and ($excluded -contains $_.ScanType)) {
+            return $false
+        }
+        return $true
+    } | ForEach-Object { $_.Id })
+}
+
 function Get-BackupTypeInfo {
     return @{
         config = @{ Name = '敏感配置'; FolderSuffix = 'config'; Description = 'SSH/IDE/浏览器等敏感配置' }
@@ -262,7 +278,10 @@ function Get-CodeDependencyExcludePatterns {
         '\pods\', '\deriveddata\', '\.idea\caches\', '\.vs\',
         '\coverage\', '\.nyc_output\', '\.sass-cache\',
         '\.npm\', '\.cache\', '\.local\share\pnpm\',
-        '\tmp\', '\temp\', '\logs\', '\log\'
+        '\tmp\', '\temp\', '\logs\', '\log\',
+        '\models\', '\model\', '\weights\', '\checkpoints\', '\checkpoint\',
+        '\dataset\', '\datasets\', '\training_data\', '\train_data\', '\test_data\',
+        '\samples\', '\raw_data\', '\pretrained\', '\pretrained_models\'
     )
 }
 

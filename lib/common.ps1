@@ -7,6 +7,183 @@ function Get-DefaultThreadCount {
     return [Environment]::ProcessorCount
 }
 
+function New-BackupFaultBreaker {
+    param(
+        [int]$TripAfterFailures = 5,
+        [string]$LogPath = ''
+    )
+
+    return [PSCustomObject]@{
+        TripAfterFailures = $TripAfterFailures
+        LogPath           = $LogPath
+        ConsecutiveFailures = 0
+        TotalFailures     = 0
+        TotalSkipped      = 0
+        ScopeFailures     = @{}
+        TrippedScopes     = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        Faults            = New-Object System.Collections.Generic.List[object]
+    }
+}
+
+function Register-BackupFault {
+    param(
+        $Breaker,
+        [string]$Phase,
+        [string]$Context,
+        [string]$Message,
+        [string]$ScopeKey = ''
+    )
+
+    if ($null -eq $Breaker) { return }
+
+    $Breaker.TotalFailures++
+    $Breaker.ConsecutiveFailures++
+    [void]$Breaker.Faults.Add([PSCustomObject]@{
+        Phase   = $Phase
+        Context = $Context
+        Message = $Message
+        Scope   = $ScopeKey
+        Time    = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    })
+
+    if ($Breaker.LogPath) {
+        $line = if ($ScopeKey) {
+            "[$Phase] $Context | $ScopeKey | $Message"
+        } else {
+            "[$Phase] $Context | $Message"
+        }
+        Write-LogLine -LogPath $Breaker.LogPath -Message "FAULT: $line"
+    }
+
+    if ($ScopeKey) {
+        $count = 0
+        if ($Breaker.ScopeFailures.ContainsKey($ScopeKey)) { $count = $Breaker.ScopeFailures[$ScopeKey] }
+        $count++
+        $Breaker.ScopeFailures[$ScopeKey] = $count
+        if ($count -ge $Breaker.TripAfterFailures) {
+            [void]$Breaker.TrippedScopes.Add($ScopeKey)
+        }
+    }
+}
+
+function Register-BackupSuccess {
+    param($Breaker)
+
+    if ($null -eq $Breaker) { return }
+    $Breaker.ConsecutiveFailures = 0
+}
+
+function Test-BackupScopeTripped {
+    param(
+        $Breaker,
+        [string]$ScopeKey
+    )
+
+    if ($null -eq $Breaker -or [string]::IsNullOrWhiteSpace($ScopeKey)) { return $false }
+
+    foreach ($tripped in $Breaker.TrippedScopes) {
+        if ($ScopeKey.Equals($tripped, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($ScopeKey.StartsWith($tripped + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Complete-RunspaceResult {
+    param(
+        $PSInstance,
+        $Handle,
+        [string]$Context = ''
+    )
+
+    try {
+        $errors = @($PSInstance.Streams.Error | ForEach-Object { $_.ToString() })
+        $result = $PSInstance.EndInvoke($Handle)
+        if ($errors.Count -gt 0) {
+            return @{
+                Ok      = $false
+                Result  = $result
+                Error   = ($errors -join '; ')
+                Context = $Context
+            }
+        }
+        return @{
+            Ok      = $true
+            Result  = $result
+            Error   = ''
+            Context = $Context
+        }
+    }
+    catch {
+        return @{
+            Ok      = $false
+            Result  = $null
+            Error   = $_.Exception.Message
+            Context = $Context
+        }
+    }
+}
+
+function Resolve-RunspacePayload {
+    param(
+        $Payload,
+        [string]$DefaultPhase = 'task'
+    )
+
+    if ($null -eq $Payload) {
+        return @{ Ok = $false; Items = @(); Error = 'Empty runspace result' }
+    }
+
+    $hasOk = $false
+    $okValue = $false
+    $itemsValue = @()
+    $errorValue = ''
+
+    if ($Payload -is [hashtable]) {
+        $hasOk = $Payload.ContainsKey('Ok')
+        if ($hasOk) {
+            $okValue = [bool]$Payload['Ok']
+            if ($Payload.ContainsKey('Items') -and $null -ne $Payload['Items']) {
+                $itemsValue = @($Payload['Items'])
+            }
+            if ($Payload.ContainsKey('Error')) { $errorValue = [string]$Payload['Error'] }
+        }
+    }
+    elseif ($null -ne $Payload.PSObject.Properties['Ok']) {
+        $hasOk = $true
+        $okValue = [bool]$Payload.Ok
+        if ($null -ne $Payload.PSObject.Properties['Items'] -and $null -ne $Payload.Items) {
+            $itemsValue = @($Payload.Items)
+        }
+        if ($null -ne $Payload.PSObject.Properties['Error']) { $errorValue = [string]$Payload.Error }
+    }
+
+    if ($hasOk) {
+        return @{ Ok = $okValue; Items = $itemsValue; Error = $errorValue }
+    }
+
+    return @{ Ok = $true; Items = @($Payload); Error = '' }
+}
+
+function Show-BackupFaultSummary {
+    param($Breaker)
+
+    if ($null -eq $Breaker -or $Breaker.TotalFailures -le 0) { return }
+
+    Write-Host ''
+    Write-Host ("Fault tolerance: {0} issue(s) skipped, backup continued." -f $Breaker.TotalFailures) -ForegroundColor Yellow
+    if ($Breaker.TrippedScopes.Count -gt 0) {
+        Write-Host ("Circuit breaker tripped for {0} path scope(s)." -f $Breaker.TrippedScopes.Count) -ForegroundColor Yellow
+    }
+
+    $preview = @($Breaker.Faults | Select-Object -First 5)
+    foreach ($fault in $preview) {
+        Write-Host ("  - [{0}] {1}: {2}" -f $fault.Phase, $fault.Context, $fault.Message) -ForegroundColor DarkYellow
+    }
+    if ($Breaker.Faults.Count -gt 5) {
+        Write-Host ("  ... and {0} more (see backup.log)" -f ($Breaker.Faults.Count - 5)) -ForegroundColor DarkYellow
+    }
+}
+
 function Get-BackupArchiveName {
     param([string]$BackupRoot)
     $folderName = Split-Path $BackupRoot -Leaf
@@ -49,40 +226,59 @@ function Resolve-BackupArchivePath {
 function Compress-BackupArchive {
     param(
         [string]$FilesRoot,
-        [string]$ArchivePath
+        [string]$ArchivePath,
+        $FaultBreaker = $null
     )
 
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     if (Test-Path -LiteralPath $ArchivePath) {
-        Remove-Item -LiteralPath $ArchivePath -Force
+        Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
     }
 
-    $zip = [System.IO.Compression.ZipFile]::Open($ArchivePath, [System.IO.Compression.ZipArchiveMode]::Create)
+    $added = 0
+    $failed = 0
+    $zip = $null
+
     try {
+        $zip = [System.IO.Compression.ZipFile]::Open($ArchivePath, [System.IO.Compression.ZipArchiveMode]::Create)
         $allFiles = Get-ChildItem -LiteralPath $FilesRoot -Recurse -File -Force -ErrorAction SilentlyContinue
         $done = 0
         $total = @($allFiles).Count
         foreach ($file in $allFiles) {
             $done++
-            $relative = $file.FullName.Substring($FilesRoot.Length).TrimStart('\').Replace('\', '/')
             if ($done % 10 -eq 0 -or $done -eq $total) {
                 Show-ProgressBar -Done $done -Total $total -Status (Split-Path $file.FullName -Leaf) -Phase '压缩归档'
             }
-            $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
-            $entryStream = $entry.Open()
+
             try {
-                $inputStream = [System.IO.File]::OpenRead($file.FullName)
-                try { $inputStream.CopyTo($entryStream) } finally { $inputStream.Dispose() }
+                $relative = $file.FullName.Substring($FilesRoot.Length).TrimStart('\').Replace('\', '/')
+                $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entryStream = $entry.Open()
+                try {
+                    $inputStream = [System.IO.File]::OpenRead($file.FullName)
+                    try { $inputStream.CopyTo($entryStream) } finally { $inputStream.Dispose() }
+                }
+                finally { $entryStream.Dispose() }
+                $added++
             }
-            finally { $entryStream.Dispose() }
+            catch {
+                $failed++
+                Register-BackupFault -Breaker $FaultBreaker -Phase '压缩归档' -Context $file.FullName -Message $_.Exception.Message
+            }
         }
     }
-    finally {
-        $zip.Dispose()
+    catch {
+        Register-BackupFault -Breaker $FaultBreaker -Phase '压缩归档' -Context $ArchivePath -Message $_.Exception.Message
+        throw
     }
-    Complete-ProgressBar
+    finally {
+        if ($null -ne $zip) { $zip.Dispose() }
+        Complete-ProgressBar
+    }
+
+    return @{ Added = $added; Failed = $failed; Total = ($added + $failed) }
 }
 
 function Expand-BackupArchive {
@@ -181,13 +377,17 @@ function Invoke-ParallelRestoreOrExport {
 
     $total = $Entries.Count
     foreach ($rs in $runspaces) {
-        $result = $rs.PS.EndInvoke($rs.Handle)
+        $completed = Complete-RunspaceResult -PSInstance $rs.PS -Handle $rs.Handle -Context 'restore'
         $rs.PS.Dispose()
         $sync.Done++
-        Show-ProgressBar -Done $sync.Done -Total $total -Status $result.Path -Phase '恢复文件'
 
-        if ($result.Skipped) { $sync.Skipped++ }
-        elseif ($result.Ok) { $sync.Restored++ }
+        $result = $null
+        if ($completed.Ok) { $result = $completed.Result }
+        $path = if ($result -and $result.Path) { $result.Path } else { $completed.Context }
+        Show-ProgressBar -Done $sync.Done -Total $total -Status $path -Phase '恢复文件'
+
+        if ($result -and $result.Skipped) { $sync.Skipped++ }
+        elseif ($result -and $result.Ok) { $sync.Restored++ }
         else { $sync.Failed++ }
     }
 
@@ -228,48 +428,51 @@ function Get-CatalogFileCandidates {
 
         foreach ($item in $category.Items) {
             $sourcePath = $item.Path
-            if (-not (Test-Path -LiteralPath $sourcePath)) { continue }
+            try {
+                if (-not (Test-Path -LiteralPath $sourcePath)) { continue }
 
-            $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-            $files = @()
+                $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+                $files = @()
 
-            if ($sourceItem.PSIsContainer) {
-                $includePatterns = if ($item.Patterns) { $item.Patterns } else { @('*') }
-                $files = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        $matched = $false
-                        foreach ($pattern in $includePatterns) {
-                            if ($_.Name -like $pattern -or $_.FullName -like $pattern) {
-                                $matched = $true
-                                break
-                            }
-                        }
-                        $matched
-                    }
-            }
-            else {
-                $files = @($sourceItem)
-            }
-
-            foreach ($file in $files) {
-                if (Test-ShouldExcludePath -FullPath $file.FullName -BackupRoot $BackupRoot) { continue }
-                if ($file.Length -gt $MaxFileSizeBytes) { continue }
-
-                $relative = Join-Path $category.Id $file.Name
                 if ($sourceItem.PSIsContainer) {
-                    $sub = $file.FullName.Substring($sourcePath.Length).TrimStart('\')
-                    $relative = Join-Path $category.Id $sub
+                    $includePatterns = if ($item.Patterns) { $item.Patterns } else { @('*') }
+                    $files = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            $matched = $false
+                            foreach ($pattern in $includePatterns) {
+                                if ($_.Name -like $pattern -or $_.FullName -like $pattern) {
+                                    $matched = $true
+                                    break
+                                }
+                            }
+                            $matched
+                        }
+                }
+                else {
+                    $files = @($sourceItem)
                 }
 
-                $candidates.Add([PSCustomObject]@{
-                    SourcePath  = $file.FullName
-                    BackupPath  = $relative.Replace('/', '\')
-                    SizeBytes   = $file.Length
-                    CategoryId  = $category.Id
-                    CategoryName = $category.Name
-                    Description = if ($item.FileDesc) { $item.FileDesc } else { $category.Description }
-                })
+                foreach ($file in $files) {
+                    if (Test-ShouldExcludePath -FullPath $file.FullName -BackupRoot $BackupRoot) { continue }
+                    if ($file.Length -gt $MaxFileSizeBytes) { continue }
+
+                    $relative = Join-Path $category.Id $file.Name
+                    if ($sourceItem.PSIsContainer) {
+                        $sub = $file.FullName.Substring($sourcePath.Length).TrimStart('\')
+                        $relative = Join-Path $category.Id $sub
+                    }
+
+                    $candidates.Add([PSCustomObject]@{
+                        SourcePath  = $file.FullName
+                        BackupPath  = $relative.Replace('/', '\')
+                        SizeBytes   = $file.Length
+                        CategoryId  = $category.Id
+                        CategoryName = $category.Name
+                        Description = if ($item.FileDesc) { $item.FileDesc } else { $category.Description }
+                    })
+                }
             }
+            catch { }
         }
     }
 
@@ -284,7 +487,8 @@ function Invoke-RunspacePoolBatch {
         [array]$Runspaces,
         [int]$Total,
         [string]$Phase,
-        [scriptblock]$OnResult
+        [scriptblock]$OnResult,
+        $FaultBreaker = $null
     )
 
     $remaining = New-Object System.Collections.Generic.List[object]
@@ -296,10 +500,24 @@ function Invoke-RunspacePoolBatch {
             $rs = $remaining[$i]
             if (-not $rs.Handle.IsCompleted) { continue }
 
-            $result = $rs.PS.EndInvoke($rs.Handle)
+            $context = if ($rs.Job) {
+                $root = if ($rs.Job.Root) { [string]$rs.Job.Root } else { '' }
+                if ($root) { $root } else { [string]$rs.Job.ScanCat.Name }
+            } else { $Phase }
+
+            $completed = Complete-RunspaceResult -PSInstance $rs.PS -Handle $rs.Handle -Context $context
             $rs.PS.Dispose()
             $done++
-            & $OnResult $rs $result $done $Total
+
+            if (-not $completed.Ok) {
+                Register-BackupFault -Breaker $FaultBreaker -Phase $Phase -Context $context -Message $completed.Error -ScopeKey $context
+                & $OnResult $rs @() $done $Total $completed
+            }
+            else {
+                Register-BackupSuccess -Breaker $FaultBreaker
+                & $OnResult $rs $completed.Result $done $Total $completed
+            }
+
             $remaining.RemoveAt($i)
         }
 
@@ -318,7 +536,8 @@ function Get-ScanFileCandidates {
         [long]$MinLargeFileBytes = 0,
         [string[]]$LargeFileDriveLetters = @(),
         [int]$ThreadCount = 0,
-        [int]$MaxFiles = 0
+        [int]$MaxFiles = 0,
+        $FaultBreaker = $null
     )
 
     . (Join-Path $PSScriptRoot 'catalog.ps1')
@@ -338,11 +557,22 @@ function Get-ScanFileCandidates {
         if ($scanCat.ScanType -eq 'source_code') {
             $searchRoots = @(Get-ScanRootsByType -ScanType $scanCat.ScanType -DriveLetters $DriveLetters -LargeFileDriveLetters $LargeFileDriveLetters)
             Write-Host 'Discovering git/readme project roots...' -ForegroundColor Yellow
-            $projects = Discover-SourceCodeProjectRoots -SearchRoots $searchRoots -BackupRoot $BackupRoot
+            try {
+                $projects = Discover-SourceCodeProjectRoots -SearchRoots $searchRoots -BackupRoot $BackupRoot
+            }
+            catch {
+                Register-BackupFault -Breaker $FaultBreaker -Phase '扫描磁盘' -Context 'project discovery' -Message $_.Exception.Message
+                Write-Host ("Project discovery failed, skipping source code scan: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                $projects = @()
+            }
             $gitCount = @($projects | Where-Object { $_.Kind -eq 'git' }).Count
             $readmeCount = @($projects | Where-Object { $_.Kind -eq 'readme' }).Count
             Write-Host ("Found {0} git projects, {1} readme projects" -f $gitCount, $readmeCount) -ForegroundColor Cyan
             foreach ($proj in $projects) {
+                if (Test-BackupScopeTripped -Breaker $FaultBreaker -ScopeKey $proj.Root) {
+                    if ($null -ne $FaultBreaker) { $FaultBreaker.TotalSkipped++ }
+                    continue
+                }
                 $jobs.Add(@{
                     ScanCat     = $scanCat
                     Root        = $proj.Root
@@ -353,7 +583,11 @@ function Get-ScanFileCandidates {
         }
 
         foreach ($root in (Get-ScanRootsByType -ScanType $scanCat.ScanType -DriveLetters $DriveLetters -LargeFileDriveLetters $LargeFileDriveLetters)) {
-            $jobs.Add(@{ ScanCat = $scanCat; Root = $root })
+            if (Test-BackupScopeTripped -Breaker $FaultBreaker -ScopeKey $root) {
+                if ($null -ne $FaultBreaker) { $FaultBreaker.TotalSkipped++ }
+                continue
+            }
+            $jobs.Add(@{ ScanCat = $scanCat; Root = $root; ProjectKind = '' })
         }
     }
 
@@ -388,22 +622,42 @@ function Get-ScanFileCandidates {
         $ps = [powershell]::Create()
         $null = $ps.AddScript({
             param($LibPath, $Job, $MaxFileSizeBytes, $MinLargeFileBytes, $BackupRoot)
-            . (Join-Path $LibPath 'scan_worker.ps1')
-            return (Invoke-SingleScanJob -Job $Job -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -BackupRoot $BackupRoot)
+            try {
+                . (Join-Path $LibPath 'scan_worker.ps1')
+                return @(Invoke-SingleScanJob -Job $Job -MaxFileSizeBytes $MaxFileSizeBytes -MinLargeFileBytes $MinLargeFileBytes -BackupRoot $BackupRoot)
+            }
+            catch {
+                return @()
+            }
         }).AddArgument($libPath).AddArgument($job).AddArgument($MaxFileSizeBytes).AddArgument($MinLargeFileBytes).AddArgument($BackupRoot)
         $ps.RunspacePool = $pool
         @{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $job }
     }
 
-    Invoke-RunspacePoolBatch -Runspaces $runspaces -Total $jobs.Count -Phase '扫描磁盘' -OnResult {
-        param($Rs, $Batch, $Done, $Total)
+    Invoke-RunspacePoolBatch -Runspaces $runspaces -Total $jobs.Count -Phase '扫描磁盘' -FaultBreaker $FaultBreaker -OnResult {
+        param($Rs, $Batch, $Done, $Total, $Completed)
 
-        $kindTag = if ($Rs.Job.ProjectKind) { "[$($Rs.Job.ProjectKind)] " } else { '' }
+        $projectKind = Get-ScanJobOptionalProperty -Job $Rs.Job -Name 'ProjectKind'
+        $kindTag = if ($projectKind) { "[$projectKind] " } else { '' }
         $jobLabel = "$($Rs.Job.ScanCat.Name) | ${kindTag}$($Rs.Job.Root)"
         Show-ProgressBar -Done $Done -Total $Total -Status $jobLabel -Phase '扫描磁盘'
 
-        foreach ($item in $Batch) {
-            $key = $item.SourcePath.ToLowerInvariant()
+        if ($Completed -and -not $Completed.Ok) {
+            Register-BackupFault -Breaker $FaultBreaker -Phase '扫描磁盘' -Context $Rs.Job.Root -Message $Completed.Error -ScopeKey $Rs.Job.Root
+            return
+        }
+
+        if ($null -eq $Batch) { return }
+
+        foreach ($item in @($Batch)) {
+            if ($null -eq $item) { continue }
+            try {
+                $key = $item.SourcePath.ToLowerInvariant()
+            }
+            catch {
+                Register-BackupFault -Breaker $FaultBreaker -Phase '扫描磁盘' -Context $Rs.Job.Root -Message $_.Exception.Message -ScopeKey $Rs.Job.Root
+                continue
+            }
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
             [void]$candidates.Add($item)
@@ -413,6 +667,7 @@ function Get-ScanFileCandidates {
     $pool.Close()
     $pool.Dispose()
     Complete-ProgressBar
+    Write-Host ("Scan finished: {0} unique files from {1} tasks" -f $candidates.Count, $jobs.Count) -ForegroundColor Cyan
     return $candidates
 }
 
@@ -422,7 +677,8 @@ function Get-CatalogFileCandidatesParallel {
         [string[]]$CategoryFilter = @(),
         [long]$MaxFileSizeBytes,
         [string]$BackupRoot,
-        [int]$ThreadCount = 0
+        [int]$ThreadCount = 0,
+        $FaultBreaker = $null
     )
 
     if ($ThreadCount -le 0) { $ThreadCount = Get-DefaultThreadCount }
@@ -444,9 +700,14 @@ function Get-CatalogFileCandidatesParallel {
         $ps = [powershell]::Create()
         $null = $ps.AddScript({
             param($LibPath, $Category, $MaxFileSizeBytes, $BackupRoot)
-            . (Join-Path $LibPath 'catalog.ps1')
-            . (Join-Path $LibPath 'common.ps1')
-            return (Get-CatalogFileCandidates -Catalog @($Category) -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot)
+            try {
+                . (Join-Path $LibPath 'catalog.ps1')
+                . (Join-Path $LibPath 'common.ps1')
+                return @(Get-CatalogFileCandidates -Catalog @($Category) -MaxFileSizeBytes $MaxFileSizeBytes -BackupRoot $BackupRoot)
+            }
+            catch {
+                return @()
+            }
         }).AddArgument($libPath).AddArgument($cat).AddArgument($MaxFileSizeBytes).AddArgument($BackupRoot)
         $ps.RunspacePool = $pool
         @{ PS = $ps; Handle = $ps.BeginInvoke(); Category = $cat }
@@ -454,13 +715,28 @@ function Get-CatalogFileCandidatesParallel {
 
     $done = 0
     foreach ($rs in $runspaces) {
-        $batch = $rs.PS.EndInvoke($rs.Handle)
+        $completed = Complete-RunspaceResult -PSInstance $rs.PS -Handle $rs.Handle -Context $rs.Category.Name
         $rs.PS.Dispose()
         $done++
         Show-ProgressBar -Done $done -Total $categories.Count -Status $rs.Category.Name -Phase '收集配置'
 
-        foreach ($item in $batch) {
-            $key = $item.SourcePath.ToLowerInvariant()
+        if (-not $completed.Ok) {
+            Register-BackupFault -Breaker $FaultBreaker -Phase '收集配置' -Context $rs.Category.Name -Message $completed.Error -ScopeKey $rs.Category.Id
+            continue
+        }
+
+        Register-BackupSuccess -Breaker $FaultBreaker
+        if ($null -eq $completed.Result) { continue }
+
+        foreach ($item in @($completed.Result)) {
+            if ($null -eq $item) { continue }
+            try {
+                $key = $item.SourcePath.ToLowerInvariant()
+            }
+            catch {
+                Register-BackupFault -Breaker $FaultBreaker -Phase '收集配置' -Context $rs.Category.Name -Message $_.Exception.Message -ScopeKey $rs.Category.Id
+                continue
+            }
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
             $all.Add($item)
@@ -476,18 +752,26 @@ function Get-CatalogFileCandidatesParallel {
 function Read-CategorySelection {
     param(
         [array]$Catalog,
-        [switch]$IncludeLargeFiles
+        [ValidateSet('config', 'all')]
+        [string]$Mode = 'all'
     )
 
+    $excludedScanTypes = if ($Mode -eq 'config') { Get-DedicatedScanTypes } else { @() }
+
     $selectable = @($Catalog | Where-Object {
-        if ($_.ContainsKey('IsScanOnly') -and $_.IsScanOnly -and $_.ScanType -eq 'large_files' -and -not $IncludeLargeFiles) {
+        if ($_.ContainsKey('IsScanOnly') -and $_.IsScanOnly -and ($excludedScanTypes -contains $_.ScanType)) {
             return $false
         }
         return $true
     })
 
     Write-Host ''
-    Write-Host 'Select backup categories (default: all):'
+    if ($Mode -eq 'config') {
+        Write-Host 'Select backup categories (sensitive config only; code/docs/large files use menu 3/4/5):'
+    }
+    else {
+        Write-Host 'Select backup categories (default: all):'
+    }
     $map = @{}
     for ($i = 0; $i -lt $selectable.Count; $i++) {
         $cat = $selectable[$i]
@@ -518,36 +802,13 @@ function Read-CategorySelection {
     return $selected.ToArray()
 }
 
-function Read-LargeFileScanOptions {
-    param([string[]]$AvailableDrives)
-
-    Write-Host ''
-    $enable = Read-Host 'Scan large files on drives? (Y/N) [N]'
-    if ($enable -notin @('Y', 'y')) {
-        return @{ Enabled = $false; MinLargeFileMB = 0; Drives = @() }
-    }
-
-    $minMb = 500
-    $minInput = Read-InteractiveChoice -Prompt 'Min large file size MB [500]' -Default '500'
-    if (-not [int]::TryParse($minInput, [ref]$minMb)) { $minMb = 500 }
-
-    Write-Host ''
-    Write-Host 'Select drives for large file scan:'
-    $drives = Read-DriveSelection -AvailableDrives $AvailableDrives
-
-    return @{
-        Enabled = $true
-        MinLargeFileMB = $minMb
-        Drives = $drives
-    }
-}
-
 function Invoke-ParallelFileBackup {
     param(
         [array]$Candidates,
         [string]$FilesRoot,
         [int]$ThreadCount = 0,
-        [scriptblock]$OnProgress
+        [scriptblock]$OnProgress,
+        $FaultBreaker = $null
     )
 
     if ($ThreadCount -le 0) {
@@ -588,11 +849,30 @@ function Invoke-ParallelFileBackup {
     }
 
     foreach ($rs in $runspaces) {
-        $copyResult = $rs.PS.EndInvoke($rs.Handle)
+        $completed = Complete-RunspaceResult -PSInstance $rs.PS -Handle $rs.Handle -Context $rs.Item.SourcePath
         $rs.PS.Dispose()
         $sync.Done++
 
-        if ($copyResult.Ok) {
+        $copyOk = $false
+        if ($completed.Ok -and $null -ne $completed.Result) {
+            $copyResult = $completed.Result
+            if ($copyResult -is [hashtable] -and $copyResult.ContainsKey('Ok')) {
+                $copyOk = [bool]$copyResult.Ok
+                if (-not $copyOk) {
+                    $err = if ($copyResult.ContainsKey('Error')) { [string]$copyResult.Error } else { 'Copy failed' }
+                    Register-BackupFault -Breaker $FaultBreaker -Phase '复制文件' -Context $rs.Item.SourcePath -Message $err
+                }
+            }
+            else {
+                $copyOk = $true
+            }
+        }
+        else {
+            Register-BackupFault -Breaker $FaultBreaker -Phase '复制文件' -Context $rs.Item.SourcePath -Message $completed.Error
+        }
+
+        if ($copyOk) {
+            Register-BackupSuccess -Breaker $FaultBreaker
             $results.Add($rs.Item)
         }
         else {
@@ -641,6 +921,9 @@ function Write-BackupReport {
     }
     [void]$sb.AppendLine("Threads: $($Meta.Threads)")
     [void]$sb.AppendLine("Total files: $($Files.Count)")
+    if ($Meta.FaultCount -and $Meta.FaultCount -gt 0) {
+        [void]$sb.AppendLine("Faults skipped: $($Meta.FaultCount)")
+    }
     [void]$sb.AppendLine('')
 
     $groups = $Files | Group-Object CategoryId

@@ -54,18 +54,6 @@ Write-Host '  4. 磁盘大文件：默认 500MB 以上（可自定义）'
 
 Write-Host ''
 
-Write-Host '【默认设置】'
-
-Write-Host '  全部备份支持多核并行（默认 CPU 核心数）'
-Write-Host '  各阶段显示进度条：收集 / 扫描 / 复制 / 压缩'
-Write-Host '  选定输出目录后可选择是否压缩（与文件夹同名、同级存放，默认压缩）'
-
-Write-Host '  输出目录按类型区分：*_config_backup / *_code_backup 等'
-
-Write-Host '  恢复时可识别备份内工具，并支持导出到指定目录'
-
-Write-Host ''
-
 Write-Host '【注意】备份含私钥与令牌，请妥善保管，详见 README.md' -ForegroundColor Yellow
 
 Write-Host ('  ' + ('=' * 62)) -ForegroundColor Cyan

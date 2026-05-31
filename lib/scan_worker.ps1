@@ -326,16 +326,49 @@ function Test-IsReadmeFile {
     return ($FileName -match '^(?i)readme(\..+)?$')
 }
 
+function Test-IsUnderProjectRoot {
+    param(
+        [string]$Path,
+        [System.Collections.Generic.HashSet[string]]$Roots
+    )
+
+    foreach ($root in $Roots) {
+        if ($Path.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($Path.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Test-IsUnderGitProjectRoot {
     param(
         [string]$Path,
         [System.Collections.Generic.HashSet[string]]$GitRoots
     )
 
-    foreach ($gitRoot in $GitRoots) {
-        if ($Path.Equals($gitRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-        if ($Path.StartsWith($gitRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return (Test-IsUnderProjectRoot -Path $Path -Roots $GitRoots)
+}
+
+function Test-IsReadmeProjectDirectory {
+    param([string]$DirPath)
+
+    $hasReadme = $false
+    $hasCode = $false
+
+    try {
+        foreach ($filePath in [System.IO.Directory]::EnumerateFiles($DirPath)) {
+            $fileName = [System.IO.Path]::GetFileName($filePath)
+            if (Test-IsReadmeFile -FileName $fileName) {
+                $hasReadme = $true
+            }
+            elseif (Test-IsCodeFile -FileName $fileName) {
+                $hasCode = $true
+            }
+
+            if ($hasReadme -and $hasCode) { return $true }
+        }
     }
+    catch { }
+
     return $false
 }
 
@@ -359,8 +392,12 @@ function Discover-SourceCodeProjectRootsInRoot {
         $dir = $stack.Pop()
         if (Test-ShouldExcludePath -FullPath $dir -BackupRoot $BackupRoot) { continue }
         if (Test-IsCodeDependencyPath -FullPath $dir) { continue }
+        if (Test-IsUnderGitProjectRoot -Path $dir -GitRoots $gitRoots) { continue }
+        if (Test-IsUnderProjectRoot -Path $dir -Roots $readmeRoots) { continue }
 
+        $childDirs = New-Object System.Collections.Generic.List[string]
         $isGitProject = $false
+
         try {
             foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
                 if (Test-ShouldExcludePath -FullPath $sub -BackupRoot $BackupRoot) { continue }
@@ -373,23 +410,20 @@ function Discover-SourceCodeProjectRootsInRoot {
                     continue
                 }
 
-                $stack.Push($sub)
+                [void]$childDirs.Add($sub)
             }
         }
         catch { continue }
 
         if ($isGitProject) { continue }
 
-        if (-not (Test-IsUnderGitProjectRoot -Path $dir -GitRoots $gitRoots)) {
-            try {
-                foreach ($filePath in [System.IO.Directory]::EnumerateFiles($dir)) {
-                    if (Test-IsReadmeFile -FileName ([System.IO.Path]::GetFileName($filePath))) {
-                        [void]$readmeRoots.Add($dir)
-                        break
-                    }
-                }
-            }
-            catch { }
+        if (Test-IsReadmeProjectDirectory -DirPath $dir) {
+            [void]$readmeRoots.Add($dir)
+            continue
+        }
+
+        foreach ($sub in $childDirs) {
+            $stack.Push($sub)
         }
     }
 
@@ -433,6 +467,7 @@ function Discover-SourceCodeProjectRoots {
     foreach ($proj in $readmeCandidates) {
         if ($gitSeen.Contains($proj.Root)) { continue }
         if (Test-IsUnderGitProjectRoot -Path $proj.Root -GitRoots $gitSeen) { continue }
+        if (Test-IsUnderProjectRoot -Path $proj.Root -Roots $readmeSeen) { continue }
         if ($readmeSeen.Add($proj.Root)) {
             $projects.Add($proj)
         }
@@ -452,6 +487,25 @@ function Test-ShouldSplitScanRoot {
     if ($Root -ieq 'C:\ProgramData') { return $true }
     if ($ScanType -in @('large_files', 'source_code', 'documents')) { return $true }
     return $false
+}
+
+function Get-ScanJobOptionalProperty {
+    param(
+        [object]$Job,
+        [string]$Name,
+        [string]$Default = ''
+    )
+
+    if ($null -eq $Job) { return $Default }
+
+    if ($Job -is [hashtable]) {
+        if ($Job.ContainsKey($Name)) { return [string]$Job[$Name] }
+        return $Default
+    }
+
+    $prop = $Job.PSObject.Properties[$Name]
+    if ($null -ne $prop) { return [string]$prop.Value }
+    return $Default
 }
 
 function Expand-ScanJobsForParallelism {
@@ -474,6 +528,7 @@ function Expand-ScanJobsForParallelism {
 
         $scanType = $job.ScanCat.ScanType
         $root = [string]$job.Root
+        $projectKind = Get-ScanJobOptionalProperty -Job $job -Name 'ProjectKind'
         if (-not (Test-ShouldSplitScanRoot -Root $root -ScanType $scanType)) {
             [void]$expanded.Add($job)
             continue
@@ -498,11 +553,11 @@ function Expand-ScanJobsForParallelism {
         }
 
         if (-not ($root -match '^[A-Za-z]:\\$')) {
-            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $root; FilesOnlyAtRoot = $true })
+            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $root; FilesOnlyAtRoot = $true; ProjectKind = $projectKind })
         }
 
         foreach ($sub in $subDirs) {
-            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $sub })
+            [void]$expanded.Add(@{ ScanCat = $job.ScanCat; Root = $sub; ProjectKind = $projectKind })
             if ($expanded.Count -ge $maxJobs) { break }
         }
     }
