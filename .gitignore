@@ -1,0 +1,56 @@
+# Python virtualenv
+.venv/
+venv/
+
+# Backup outputs (may contain SSH keys, tokens, browser data, etc.)
+test_output/
+*_backup/
+*_backup.zip
+*_backup_*/
+**/_extract_cache/
+
+# Backup artifacts
+**/backup.log
+**/restore.log
+**/manifest.json
+**/backup_report.md
+**/files/
+
+# Sensitive / credential patterns (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.pvk
+*.p12
+*.pfx
+*.ppk
+id_rsa
+id_rsa.*
+id_ed25519*
+known_hosts*
+credentials
+credentials.json
+secrets.json
+*.keystore
+*.jks
+.git-credentials
+.netrc
+.pypirc
+auth.json
+service-account.json
+google-services.json
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Temp / scratch
+*.tmp
+*.temp
+_test_*.ps1
